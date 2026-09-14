@@ -23,10 +23,12 @@
 #   BIN_DIR=~/bin                install somewhere other than ~/.local/bin
 #   OMASEND_REPO=user/repo       download from a fork's releases
 #   OMASEND_ALLOW_PREBUILT=1     opt in to the pinned release binary instead of
-#                                building. Still refuses anything whose SHA-256
-#                                misses engine/SHA256SUMS, but a prebuilt binary
-#                                cannot be audited from this tree — which is why
-#                                it is off by default.
+#                                building. The download is bounded, staged
+#                                non-executable, and installed only if its
+#                                SHA-256 matches the one committed in
+#                                engine/SHA256SUMS at this commit — but a
+#                                prebuilt binary cannot be audited from this
+#                                tree, which is why it is off by default.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,6 +36,10 @@ BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 BIN="$BIN_DIR/omasend-engine"
 REPO="${OMASEND_REPO:-28allday/omasend-quattro}"
 SUMS="$ROOT/engine/SHA256SUMS"
+# Ceiling for the optional prebuilt download. The engine is ~7.5 MB; this is
+# generous headroom for growth and still small enough that a hostile or
+# misdirected response cannot fill the disk before the digest is checked.
+MAX_ENGINE_BYTES=33554432   # 32 MiB
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'omasend-setup: %s\n' "$*" >&2; exit 1; }
@@ -84,7 +90,11 @@ omarchy_cmd() {
 bar_state() {
   omarchy="$(omarchy_cmd)"
   [ -n "$omarchy" ] || { printf 'unknown\n'; return 0; }
-  "$omarchy" plugin list 2>/dev/null |
+  # `|| true`: under `set -e` a failing `plugin list` (no shell running to
+  # answer) would otherwise abort the whole script from inside the command
+  # substitution that calls this — silently, before the engine is installed.
+  # "unknown" is exactly the answer that case is meant to produce.
+  { "$omarchy" plugin list 2>/dev/null || true; } |
     awk -v id="$1" '$1 == id { print $2; found = 1 } END { if (!found) print "unknown" }'
 }
 
@@ -180,14 +190,39 @@ say "Using the prebuilt release binary at your request (OMASEND_ALLOW_PREBUILT=1
 asset="$(asset_name)"
 url="https://github.com/$REPO/releases/download/v$version/$asset"
 
+# The digest comes from this checkout, not from the release. A release asset is
+# mutable — it can be replaced under a tag that already exists — so the only
+# thing worth pinning against is the SHA-256 committed here, which is fixed for
+# the commit a reviewer read and cannot change without a new commit.
 [ -f "$SUMS" ] || die "engine/SHA256SUMS is missing — refusing to install an unverified binary"
 want="$(awk -v a="$asset" '$2 == a || $2 == "*"a {print $1}' "$SUMS" | head -1)"
 [ -n "$want" ] || die "no SHA-256 recorded for $asset in engine/SHA256SUMS"
+case "$want" in
+  [0-9a-f]*) [ "${#want}" -eq 64 ] || die "malformed SHA-256 for $asset in engine/SHA256SUMS" ;;
+  *)         die "malformed SHA-256 for $asset in engine/SHA256SUMS" ;;
+esac
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found — cannot verify the download"
 
 say "Downloading pinned engine v$version ($asset)…"
-tmp="$BIN.download.$$"
-trap 'rm -f "$tmp"' EXIT
-curl -fsSL -o "$tmp" "$url" || die "download failed: $url"
+# Staged unreadable-to-others and NON-EXECUTABLE: nothing that has not matched
+# the pinned digest is ever executable, and the name is unpredictable so it
+# cannot be pre-created by anything else sharing $BIN_DIR.
+tmp="$(mktemp "$BIN_DIR/.omasend-engine.XXXXXXXXXX")" ||
+  die "could not create a staging file in $BIN_DIR"
+chmod 600 "$tmp"
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+
+# The ceiling is enforced DURING the transfer, not after it: --max-filesize
+# only acts on a declared Content-Length, so the stream also runs through
+# `head -c`, which stops writing whatever the headers claim.
+if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 600 \
+     --max-filesize "$MAX_ENGINE_BYTES" "$url" |
+     head -c "$((MAX_ENGINE_BYTES + 1))" > "$tmp"; then
+  die "download failed: $url"
+fi
+size="$(wc -c < "$tmp")"
+[ "$size" -le "$MAX_ENGINE_BYTES" ] ||
+  die "refusing $asset: larger than the $MAX_ENGINE_BYTES-byte ceiling — nothing was installed"
 
 got="$(sha256sum "$tmp" | awk '{print $1}')"
 if [ "$got" != "$want" ]; then
@@ -198,7 +233,8 @@ The download does not match the checksum committed in this checkout — nothing
 was installed. Report this, or install Go and re-run to build from source."
 fi
 
+# Only now, past the digest, does it become executable.
 chmod 755 "$tmp"
 mv "$tmp" "$BIN"
-trap - EXIT
+trap - EXIT HUP INT TERM
 say "Engine installed and checksum-verified: $BIN"
