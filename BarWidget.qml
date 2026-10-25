@@ -36,7 +36,7 @@ BarWidget {
       if (root.offersPending) bits.push("incoming offer")
       return bits.length ? "Omasend — " + bits.join(", ") : "Omasend"
     }
-    foreground: root.engineUp ? Color.accent : Color.muted
+    foreground: "#ffffff"
     fixedWidth: root.bar && root.bar.vertical ? -1 : Style.space(27)
     fixedHeight: root.bar && root.bar.vertical ? Style.space(26) : -1
     onPressed: function(b) {
